@@ -5,10 +5,14 @@
 //! is compatible with [`env_logger`].
 //!
 //! [`env_logger`]: https://docs.rs/env_logger/latest/env_logger/
+mod ohfmt;
 
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
+use std::io;
 use hilog_sys::{LogLevel, LogType, OH_LOG_IsLoggable, OH_LOG_Print};
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
+use crate::ohfmt::{Buffer, HilogFormatter, TimestampPrecision};
 
 /// Service domain of logs
 ///
@@ -45,6 +49,8 @@ fn hilog_log(log_type: LogType, level: LogLevel, domain: LogDomain, tag: &CStr, 
 pub struct Builder {
     filter: env_filter::Builder,
     log_domain: LogDomain,
+    format: ohfmt::builder::Builder,
+    writer: ohfmt::writer::Builder,
     built: bool,
 }
 
@@ -122,6 +128,108 @@ impl Builder {
         self
     }
 
+    /// Sets the format function for formatting the log output.
+    ///
+    /// This function is called on each record logged and should format the
+    /// log record and output it to the given [`HilogFormatter`].
+    ///
+    /// The format function is expected to output the string directly to the
+    /// `HilogFormatter` so that implementations can use the [`std::fmt`] macros
+    /// to format and output without intermediate heap allocations. The default
+    /// `env_logger` HilogFormatter takes advantage of this.
+    ///
+    /// When the `color` feature is enabled, styling via ANSI escape codes is supported and the
+    /// output will automatically respect [`Builder::write_style`].
+    ///
+    /// # Examples
+    ///
+    /// Use a custom format to write only the log message:
+    ///
+    /// ```
+    /// use std::io::Write;
+    /// use env_logger::Builder;
+    ///
+    /// let mut builder = Builder::new();
+    ///
+    /// builder.format(|buf, record| writeln!(buf, "{}", record.args()));
+    /// ```
+    ///
+    /// [`HilogFormatter`]: fmt/struct.HilogFormatter.html
+    /// [`String`]: https://doc.rust-lang.org/stable/std/string/struct.String.html
+    /// [`std::fmt`]: https://doc.rust-lang.org/std/fmt/index.html
+    pub fn format<F>(&mut self, format: F) -> &mut Self
+    where
+        F: Fn(&mut HilogFormatter, &Record<'_>) -> io::Result<()> + Sync + Send + 'static,
+    {
+        self.format.custom_format = Some(Box::new(format));
+        self
+    }
+
+    /// Use the default format.
+    ///
+    /// This method will clear any custom format set on the builder.
+    pub fn default_format(&mut self) -> &mut Self {
+        self.format = Default::default();
+        self
+    }
+
+    /// Whether or not to write the level in the default format.
+    pub fn format_level(&mut self, write: bool) -> &mut Self {
+        self.format.format_level = write;
+        self
+    }
+
+    /// Whether or not to write the module path in the default format.
+    pub fn format_module_path(&mut self, write: bool) -> &mut Self {
+        self.format.format_module_path = write;
+        self
+    }
+
+    /// Whether or not to write the target in the default format.
+    pub fn format_target(&mut self, write: bool) -> &mut Self {
+        self.format.format_target = write;
+        self
+    }
+
+    /// Configures the amount of spaces to use to indent multiline log records.
+    /// A value of `None` disables any kind of indentation.
+    pub fn format_indent(&mut self, indent: Option<usize>) -> &mut Self {
+        self.format.format_indent = indent;
+        self
+    }
+
+    /// Configures if timestamp should be included and in what precision.
+    pub fn format_timestamp(&mut self, timestamp: Option<TimestampPrecision>) -> &mut Self {
+        self.format.format_timestamp = timestamp;
+        self
+    }
+
+    /// Configures the timestamp to use second precision.
+    pub fn format_timestamp_secs(&mut self) -> &mut Self {
+        self.format_timestamp(Some(TimestampPrecision::Seconds))
+    }
+
+    /// Configures the timestamp to use millisecond precision.
+    pub fn format_timestamp_millis(&mut self) -> &mut Self {
+        self.format_timestamp(Some(TimestampPrecision::Millis))
+    }
+
+    /// Configures the timestamp to use microsecond precision.
+    pub fn format_timestamp_micros(&mut self) -> &mut Self {
+        self.format_timestamp(Some(TimestampPrecision::Micros))
+    }
+
+    /// Configures the timestamp to use nanosecond precision.
+    pub fn format_timestamp_nanos(&mut self) -> &mut Self {
+        self.format_timestamp(Some(TimestampPrecision::Nanos))
+    }
+
+    /// Configures the end of line suffix.
+    pub fn format_suffix(&mut self, suffix: &'static str) -> &mut Self {
+        self.format.format_suffix = suffix;
+        self
+    }
+
     /// Initializes the global logger with the built env logger.
     ///
     /// This should be called early in the execution of a Rust program. Any log
@@ -169,16 +277,21 @@ impl Builder {
         Logger {
             domain: self.log_domain,
             filter: self.filter.build(),
+            writer: self.writer.build(),
+            format: self.format.build(),
         }
     }
 
 }
 
-
+use crate::ohfmt::HilogFormatFn;
+use crate::ohfmt::writer::HilogWriter;
 
 pub struct Logger  {
     domain: LogDomain,
-    filter: env_filter::Filter
+    filter: env_filter::Filter,
+    writer: HilogWriter,
+    format: HilogFormatFn,
 }
 
 impl Logger {
@@ -207,12 +320,58 @@ impl Log for Logger {
 
         // Todo: we could write to a fixed size array on the stack, since hilog anyway has a
         // maximum supported size for tag and log.
-        let tag = record.module_path().and_then(|path| CString::new(path).ok())
-            .unwrap_or_default();
         // Todo: I think we also need / want to split messages at newlines.
-        let message = format!("{}\0", record.args());
-        let c_msg = CString::from_vec_with_nul(message.into_bytes()).unwrap_or_default();
-        hilog_log(hilog_sys::LogType::LOG_APP, record.level().into(), self.domain, tag.as_ref(), c_msg.as_ref())
+
+        // Log records are written to a thread-local buffer before being printed
+        // to the terminal. We clear these buffers afterwards, but they aren't shrunk
+        // so will always at least have capacity for the largest log record formatted
+        // on that thread.
+        //
+        // If multiple `Logger`s are used by the same threads then the thread-local
+        // formatter might have different color support. If this is the case the
+        // formatter and its buffer are discarded and recreated.
+
+        thread_local! {
+                static FORMATTER: RefCell<Option<HilogFormatter>> = const { RefCell::new(None) };
+            }
+        
+        let print = |formatter: &mut HilogFormatter, record: &Record<'_>| {
+            let tag = record.module_path().and_then(|path| CString::new(path).ok())
+                .unwrap_or_default();
+            let _ =
+                (self.format)(formatter, record).and_then(|_| formatter.print(&self.writer, record.level().into(), self.domain, tag.as_ref()));
+
+            // Always clear the buffer afterwards
+            formatter.clear();
+        };
+
+        let printed = FORMATTER
+            .try_with(|tl_buf| {
+                if let Ok(mut tl_buf) = tl_buf.try_borrow_mut() {
+                    // There are no active borrows of the buffer
+                    if let Some(ref mut formatter) = *tl_buf {
+                        // We have a previously set formatter
+                        print(formatter, record);
+                    } else {
+                        // We don't have a previously set formatter
+                        let mut formatter = HilogFormatter::new(&self.writer);
+                        print(&mut formatter, record);
+
+                        *tl_buf = Some(formatter);
+                    }
+                } else {
+                    // There's already an active borrow of the buffer (due to re-entrancy)
+                    print(&mut HilogFormatter::new(&self.writer), record);
+                }
+            })
+            .is_ok();
+
+        if !printed {
+            // The thread-local storage was not available (because its
+            // destructor has already run). Create a new single-use
+            // Formatter on the stack for this call.
+            print(&mut HilogFormatter::new(&self.writer), record);
+        }
     }
 
     fn flush(&self) {}
