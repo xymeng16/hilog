@@ -75,7 +75,7 @@ impl Builder {
     /// Only include messages for info and above for logs in `path::to::module`:
     ///
     /// ```
-    /// use env_filter::Builder;
+    /// use hilog::Builder;
     /// use log::LevelFilter;
     ///
     /// let mut builder = Builder::new();
@@ -94,7 +94,7 @@ impl Builder {
     /// Only include messages for info and above for logs globally:
     ///
     /// ```
-    /// use env_filter::Builder;
+    /// use hilog::Builder;
     /// use log::LevelFilter;
     ///
     /// let mut builder = Builder::new();
@@ -116,7 +116,7 @@ impl Builder {
     /// Only include messages for info and above for logs in `path::to::module`:
     ///
     /// ```
-    /// use env_filter::Builder;
+    /// use hilog::Builder;
     /// use log::LevelFilter;
     ///
     /// let mut builder = Builder::new();
@@ -147,14 +147,14 @@ impl Builder {
     ///
     /// ```
     /// use std::io::Write;
-    /// use env_logger::Builder;
+    /// use hilog::Builder;
     ///
     /// let mut builder = Builder::new();
     ///
     /// builder.format(|buf, record| writeln!(buf, "{}", record.args()));
     /// ```
     ///
-    /// [`HilogFormatter`]: fmt/struct.HilogFormatter.html
+    /// [`HilogFormatter`]: ohfmt/struct.HilogFormatter.html
     /// [`String`]: https://doc.rust-lang.org/stable/std/string/struct.String.html
     /// [`std::fmt`]: https://doc.rust-lang.org/std/fmt/index.html
     pub fn format<F>(&mut self, format: F) -> &mut Self
